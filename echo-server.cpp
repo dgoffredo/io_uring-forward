@@ -56,13 +56,14 @@ int main() {
     POSIX_REQUIRE("accept()", connfd = accept(listenfd, NULL, NULL));
 
     for (;;) {
-      constexpr int splice_size = 3;
+      constexpr int splice_size = 1024;
       io_uring_sqe *sqe;
       io_uring_cqe *cqe;
 
       PTR_REQUIRE("io_uring_get_sqe()", sqe = io_uring_get_sqe(&ring));
       io_uring_prep_splice(sqe, connfd, -1, pipefds[1], -1, splice_size, 0);
-      sqe->flags |= IOSQE_IO_LINK;
+      // sqe->flags |= IOSQE_IO_LINK;
+      sqe->flags |= IOSQE_IO_HARDLINK;
 
       PTR_REQUIRE("io_uring_get_sqe()", sqe = io_uring_get_sqe(&ring));
       io_uring_prep_splice(sqe, pipefds[0], -1, connfd, -1, splice_size, 0);
@@ -72,9 +73,14 @@ int main() {
       for (int i = 0; i < 2; i++) {
         URING_REQUIRE("io_uring_wait_cqe()", io_uring_wait_cqe(&ring, &cqe));
         URING_REQUIRE("cqe->res", cqe->res);
-        std::cout << "Result of the operation i=" << i << ": " << cqe->res
+        const int result = cqe->res;
+        std::cout << "Result of the operation i=" << i << ": " << result
                   << '\n';
         io_uring_cqe_seen(&ring, cqe);
+        if (i == 0 && result == 0) {
+          std::cout << "Nothing more to read.\n";
+          return 0;
+        }
       }
     }
 

@@ -56,7 +56,7 @@ int main() {
     POSIX_REQUIRE("accept()", connfd = accept(listenfd, NULL, NULL));
 
     for (;;) {
-      constexpr int splice_size = 1024;
+      constexpr int splice_size = 4096;
       io_uring_sqe *sqe;
       io_uring_cqe *cqe;
 

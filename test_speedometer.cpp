@@ -9,10 +9,13 @@ int main() {
   std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
 
   std::mt19937 generator;
-  std::normal_distribution<double> normal{100, 10};
+  std::normal_distribution<double> normal{10, 1};
   const auto random = [&]() -> int { return std::lround(normal(generator)); };
 
   for (int i = 0;; ++i, now += std::chrono::milliseconds(random())) {
-    std::cout << "After i=" << i << ": " << rate.update(now, i) << '\n';
+    rate.update(now, i);
+    std::cout << "After i=" << i << ": size=" << rate.size()
+              << " instant=" << rate.instant_rate()
+              << " average=" << rate.average_rate() << '\n';
   }
 }

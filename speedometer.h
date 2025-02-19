@@ -56,9 +56,9 @@ void Speedometer<Number>::update(std::chrono::steady_clock::time_point when,
 
   // Update are running total of rates with the rate between the point we just
   // inserted and the previous.
-  const auto& [t1, v1] = measurements.back();
-  const auto& [t2, v2] = *(measurements.end() - 2);
-  sum_of_rates += (v2 - v1) / static_cast<long double>((t2 - t1).count());
+  const auto& [t2, v2] = measurements.back();
+  const auto& [t1, v1] = *(measurements.end() - 2);
+  sum_of_rates += (v2 - v1) / (static_cast<long double>((t2 - t1).count()) / interval.count());
 
   // Pop measurements from the past while doing so leaves at least an
   // `interval`'s worth of data. Reduce the running total of rates for each
@@ -76,7 +76,7 @@ void Speedometer<Number>::update(std::chrono::steady_clock::time_point when,
     assert(iter + 1 != measurements.end());
     const auto& [t1, v1] = *iter;
     const auto& [t2, v2] = *(iter + 1);
-    sum_of_rates -= (v2 - v1) / static_cast<long double>((t2 - t1).count());
+    sum_of_rates -= (v2 - v1) / (static_cast<long double>((t2 - t1).count()) / interval.count());
   }
   measurements.erase(measurements.begin(), horizon);
 
@@ -105,7 +105,7 @@ double Speedometer<Number>::average_rate() const {
     case 1:
       return std::numeric_limits<double>::infinity();
   }
-  return sum_of_rates / measurements.size() * interval.count();
+  return sum_of_rates / measurements.size();
 }
 
 template <typename Number>

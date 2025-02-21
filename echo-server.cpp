@@ -56,8 +56,8 @@ class Net {
   // an error occurs.
   virtual int server_socket(int backlog) = 0;
 
-  // Return a socket connected to the local address to which `server_fd` is
-  // bound, or return `-errno` if an error occurs.
+  // Return a socket connected to the address to which `server_fd` is bound, or
+  // return `-errno` if an error occurs.
   virtual int client_socket(int server_fd) = 0;
 };
 
@@ -270,26 +270,55 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
                      int (&pipe1fds)[2], int (&pipe2fds)[2]) {
   const auto interval = std::chrono::seconds(5);
   const auto start = std::chrono::steady_clock::now();
-  auto last_flush = start;
-  std::uint64_t last_snapshot = 0;
+  struct {
+    std::chrono::steady_clock::time_point when;
+    std::uint64_t bytes_sent = 0;
+    std::uint64_t short_reads = 0;
+    std::uint64_t short_writes_echo = 0;
+    std::uint64_t short_writes_observer = 0;
+    std::uint64_t short_writes_pipe = 0;
+  } snapshot;
+  snapshot.when = start;
+
   const int splice_size = bufsize;
   std::ofstream log("log");
 
-  for (std::uint64_t bytes_sent = 0;;) {
+  std::uint64_t bytes_sent = 0;
+  std::uint64_t short_reads = 0;
+  std::uint64_t short_writes_echo = 0;
+  std::uint64_t short_writes_observer = 0;
+  std::uint64_t short_writes_pipe = 0;
+
+  for (;;) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_flush >= interval) {
+    if (now - snapshot.when >= interval) {
       std::ostringstream sstream;
       sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
                      .count()
               << " s\t"
-              << ((bytes_sent - last_snapshot) * (now - last_flush) /
-                  std::chrono::seconds(1) / 1'000'000.0)
-              << " MB/s\n";
+              << ((bytes_sent - snapshot.bytes_sent) * std::chrono::seconds(1) /
+                  (now - snapshot.when) / 1'000'000)
+              << " MB/s\t"
+              << ((short_reads - snapshot.short_reads) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_reads/s\t"
+              << ((short_writes_echo - snapshot.short_writes_echo) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_writes_echo/s\t"
+              << ((short_writes_observer - snapshot.short_writes_observer) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_writes_observer/s\t"
+              << ((short_writes_pipe - snapshot.short_writes_pipe) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_writes_pipe/s\n";
       const auto message = sstream.str();
       std::cout << message << std::flush;
       log << message << std::flush;
-      last_flush = now;
-      last_snapshot = bytes_sent;
+      snapshot.when = now;
+      snapshot.bytes_sent = bytes_sent;
+      snapshot.short_reads = short_reads;
+      snapshot.short_writes_echo = short_writes_echo;
+      snapshot.short_writes_observer = short_writes_observer;
     }
 
     io_uring_sqe *sqe;
@@ -323,10 +352,18 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
       const int result = cqe->res;
       io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
       io_uring_cqe_seen(&ring, cqe);
-      /*if (result < io_ctx.bytes_desired) {
-        std::cerr << "Result of the operation i=" << i << ": " << result
-                  << '\n';
-      }*/
+      if (result < io_ctx.bytes_desired) {
+        switch (io_ctx.op) {
+          case IOEntryContext::SPLICE:
+            ++short_reads;
+            break;
+          case IOEntryContext::TEE:
+            ++short_writes_pipe;
+            break;
+          default:
+            break;
+        }
+      }
       if (io_ctx.op == IOEntryContext::SPLICE && io_ctx.from_fd == conn1fd &&
           result == 0) {
         std::cerr << "Nothing more to read.\n";
@@ -368,8 +405,11 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
       bytes_sent += result;
       if (result < io_ctx.bytes_desired) {
         // TODO: This should only happen on account of a signal.
-        // std::cerr << "Result of the operation j=" << j << ": " << result
-        //          << ", so going to submit another splice.\n";
+        if (io_ctx.to_fd == conn1fd) {
+          ++short_writes_echo;
+        } else if (io_ctx.to_fd == conn2fd) {
+          ++short_writes_observer;
+        }
         io_ctx.bytes_desired -= result;
         PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
         io_uring_prep(sqe, io_ctx);
@@ -387,27 +427,57 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
 int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
   const auto interval = std::chrono::seconds(5);
   const auto start = std::chrono::steady_clock::now();
-  auto last_flush = start;
-  std::uint64_t last_snapshot = 0;
+
+  struct {
+    std::chrono::steady_clock::time_point when;
+    std::uint64_t bytes_sent = 0;
+    std::uint64_t short_reads = 0;
+    std::uint64_t short_writes_echo = 0;
+    std::uint64_t short_writes_observer = 0;
+    std::uint64_t short_writes_pipe = 0;
+  } snapshot;
+  snapshot.when = start;
+
   std::ofstream log("log");
+
+  std::uint64_t bytes_sent = 0;
+  std::uint64_t short_reads = 0;
+  std::uint64_t short_writes_echo = 0;
+  std::uint64_t short_writes_observer = 0;
+  std::uint64_t short_writes_pipe = 0;
 
   std::vector<char> buffer(bufsize);
 
-  for (std::uint64_t bytes_sent = 0;;) {
+  for (;;) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - last_flush >= interval) {
+    if (now - snapshot.when >= interval) {
       std::ostringstream sstream;
       sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
                      .count()
               << " s\t"
-              << ((bytes_sent - last_snapshot) * (now - last_flush) /
-                  std::chrono::seconds(1) / 1'000'000.0)
-              << " MB/s\n";
+              << ((bytes_sent - snapshot.bytes_sent) * std::chrono::seconds(1) /
+                  (now - snapshot.when) / 1'000'000)
+              << " MB/s\t"
+              << ((short_reads - snapshot.short_reads) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_reads/s\t"
+              << ((short_writes_echo - snapshot.short_writes_echo) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_writes_echo/s\t"
+              << ((short_writes_observer - snapshot.short_writes_observer) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_writes_observer/s\t"
+              << ((short_writes_pipe - snapshot.short_writes_pipe) *
+                  std::chrono::seconds(1) / (now - snapshot.when))
+              << " short_writes_pipe/s\n";
       const auto message = sstream.str();
       std::cout << message << std::flush;
       log << message << std::flush;
-      last_flush = now;
-      last_snapshot = bytes_sent;
+      snapshot.when = now;
+      snapshot.bytes_sent = bytes_sent;
+      snapshot.short_reads = short_reads;
+      snapshot.short_writes_echo = short_writes_echo;
+      snapshot.short_writes_observer = short_writes_observer;
     }
 
     int bytes_to_send = recv(conn1fd, buffer.data(), buffer.size(), 0);
@@ -415,6 +485,9 @@ int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
     if (bytes_to_send == 0) {
       std::cerr << "Nothing more to read.\n";
       return 0;
+    }
+    if (std::size_t(bytes_to_send) < buffer.size()) {
+      ++short_reads;
     }
 
     io_uring_sqe *sqe;
@@ -447,8 +520,11 @@ int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
       bytes_sent += result;
       if (result < io_ctx.bytes_desired) {
         // TODO: This should only happen on account of a signal.
-        // std::cerr << "Result of the operation j=" << j << ": " << result
-        //           << ", so going to submit another send().\n";
+        if (io_ctx.to_fd == conn1fd) {
+          ++short_writes_echo;
+        } else if (io_ctx.to_fd == conn2fd) {
+          ++short_writes_observer;
+        }
         io_ctx.bytes_desired -= result;
         PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
         io_uring_prep(sqe, io_ctx, 0, buffer.data() + result);
@@ -555,7 +631,7 @@ int main(int argc, char *argv[]) {
 
     std::cerr << "Waiting for echo client to connect on echo socket.\n";
     POSIX_REQUIRE(conn1fd = accept(listen1fd, NULL, NULL));
-    std::cerr << "Echo connection established.\n";
+    std::cerr << "Echo connection established.\n\n";
 
     switch (server_mode) {
       case RECVSEND:

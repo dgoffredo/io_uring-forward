@@ -1,10 +1,10 @@
 .PHONY: all
 all: echo-server forky
 
-echo-server: echo-server.cpp echo-server.cflags echo-server.lflags .last-format
+echo-server: echo-server.cpp echo-server.cflags echo-server.lflags # .last-format
 	$(CXX) $(file < echo-server.cflags) -o $@ $< $(file < echo-server.lflags)
 
-forky: forky.cpp echo-server.cflags echo-server.lflags .last-format
+forky: forky.cpp echo-server.cflags echo-server.lflags # .last-format
 	$(CXX) $(file < echo-server.cflags) -o $@ $< $(file < echo-server.lflags)
 
 .PHONY: format

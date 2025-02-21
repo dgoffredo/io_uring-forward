@@ -20,6 +20,12 @@ extern "C" {
 #include <ostream>
 #include <sstream>
 #include <utility>
+#include <vector>
+
+template <typename To, typename From>
+To bit_cast(const From& from) {
+  return *reinterpret_cast<const To*>(&from);
+}
 
 #define POSIX_REQUIRE(EXPR)                                      \
   if (-1 == (EXPR)) {                                            \
@@ -72,9 +78,9 @@ void io_uring_prep(io_uring_sqe *sqe, IOEntryContext io_ctx, int flags = 0,
                          flags);
       break;
     default:
-      std::unreachable();
+      __builtin_unreachable();
   }
-  io_uring_sqe_set_data64(sqe, std::bit_cast<std::uint64_t>(io_ctx));
+  io_uring_sqe_set_data64(sqe, bit_cast<std::uint64_t>(io_ctx));
 }
 
 // Connect to 127.0.0.1:<port> and `recv()` continuously, discarding all data.
@@ -151,7 +157,7 @@ int client_source_and_sink(int port) {
     URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
     URING_REQUIRE(cqe->res);
     const int result = cqe->res;
-    io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+    io_ctx = bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
     io_uring_cqe_seen(&ring, cqe);
     switch (io_ctx.op) {
       case IOEntryContext::RECV:
@@ -230,7 +236,7 @@ int server_splicetee(io_uring &ring, int conn1fd, int conn2fd,
       URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
       URING_REQUIRE(cqe->res);
       const int result = cqe->res;
-      io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+      io_ctx = bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
       io_uring_cqe_seen(&ring, cqe);
       /*if (result < io_ctx.bytes_desired) {
         std::cerr << "Result of the operation i=" << i << ": " << result
@@ -272,7 +278,7 @@ int server_splicetee(io_uring &ring, int conn1fd, int conn2fd,
       // TODO: handle EINTR
       URING_REQUIRE(cqe->res);
       const int result = cqe->res;
-      io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+      io_ctx = bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
       io_uring_cqe_seen(&ring, cqe);
       bytes_sent += result;
       if (result < io_ctx.bytes_desired) {
@@ -351,7 +357,7 @@ int server_recvsend(io_uring &ring, int conn1fd, int conn2fd) {
       // TODO: handle EINTR
       URING_REQUIRE(cqe->res);
       const int result = cqe->res;
-      io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+      io_ctx = bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
       io_uring_cqe_seen(&ring, cqe);
       bytes_sent += result;
       if (result < io_ctx.bytes_desired) {
@@ -399,8 +405,8 @@ int main(int argc, char *argv[]) {
   int listen2fd = -1, conn2fd = -1;
   int pipe2fds[2] = {-1, -1};
   sockaddr_in serv_addr = {};
-  const std::uint16_t echo_port = 1337;
-  const std::uint16_t observer_port = 1338;
+  std::uint16_t echo_port; // to be determined by bind()
+  std::uint16_t observer_port; // to be determined by bind()
 
   io_uring ring;
 
@@ -418,10 +424,14 @@ int main(int argc, char *argv[]) {
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    serv_addr.sin_port = htons(echo_port);
+    serv_addr.sin_port = htons(0);
 
     POSIX_REQUIRE(bind(listen1fd, (sockaddr *)&serv_addr, sizeof(serv_addr)));
     POSIX_REQUIRE(listen(listen1fd, 1));
+
+    socklen_t dummy;
+    getsockname(listen1fd, (sockaddr*) &serv_addr, &dummy);
+    echo_port = ntohs(serv_addr.sin_port);
 
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -430,12 +440,15 @@ int main(int argc, char *argv[]) {
     POSIX_REQUIRE(bind(listen2fd, (sockaddr *)&serv_addr, sizeof(serv_addr)));
     POSIX_REQUIRE(listen(listen2fd, 1));
 
+    getsockname(listen2fd, (sockaddr*) &serv_addr, &dummy);
+    observer_port = ntohs(serv_addr.sin_port);
+
     // fork() to client_sink(1338).
     switch (fork()) {
       case 0:
         // child
         // TODO: Should close all file descriptors except 0 and 1, but meh.
-        std::exit(client_sink(1338));
+        std::exit(client_sink(observer_port));
       case -1: {
         const int err = errno;
         std::cerr << "error forking to client_sink(1338): "
@@ -449,7 +462,7 @@ int main(int argc, char *argv[]) {
       case 0:
         // child
         // TODO: Should close all file descriptors except 0 and 1, but meh.
-        std::exit(client_source_and_sink(1337));
+        std::exit(client_source_and_sink(echo_port));
       case -1: {
         const int err = errno;
         std::cerr << "error forking to client_sink(1338): "
@@ -476,7 +489,7 @@ int main(int argc, char *argv[]) {
       case SPLICETEE:
         return server_splicetee(ring, conn1fd, conn2fd, pipe1fds, pipe2fds);
       default:
-        std::unreachable();
+        __builtin_unreachable();
     }
   }();
 

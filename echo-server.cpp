@@ -77,7 +77,7 @@ void io_uring_prep(io_uring_sqe *sqe, IOEntryContext io_ctx, int flags = 0,
 }
 
 // Connect to 127.0.0.1:<port> and `recv()` continuously, discarding all data.
-int sink(int port) {
+int client_sink(int port) {
   int sock;
   POSIX_REQUIRE(sock = socket(AF_INET, SOCK_STREAM, 0));
 
@@ -99,7 +99,7 @@ int sink(int port) {
 
 // Connect to 127.0.0.1:<port> and concurrently `send()` zeros and `recv()`,
 // discarding all received data.
-int source_and_sink(int port) {
+int client_source_and_sink(int port) {
   io_uring ring;
   URING_REQUIRE(io_uring_queue_init(8, &ring, 0));
 
@@ -171,6 +171,122 @@ int source_and_sink(int port) {
   }
 }
 
+int server_splicetee(io_uring &ring, int conn1fd, int conn2fd,
+                     int (&pipe1fds)[2], int (&pipe2fds)[2]) {
+  const auto interval = std::chrono::seconds(5);
+  const auto start = std::chrono::steady_clock::now();
+  auto last_flush = start;
+  std::uint64_t last_snapshot = 0;
+  constexpr int splice_size = 4096 * 16;
+  std::ofstream log("log");
+
+  for (std::uint64_t bytes_sent = 0;;) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_flush >= interval) {
+      std::ostringstream sstream;
+      sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
+                     .count()
+              << " s\t"
+              << ((bytes_sent - last_snapshot) * (now - last_flush) /
+                  std::chrono::seconds(1) / 1'000'000.0)
+              << " MB/s\n";
+      const auto message = sstream.str();
+      std::cout << message << std::flush;
+      log << message << std::flush;
+      last_flush = now;
+      last_snapshot = bytes_sent;
+    }
+
+    io_uring_sqe *sqe;
+    io_uring_cqe *cqe;
+    IOEntryContext io_ctx;
+
+    PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+    io_ctx.op = IOEntryContext::SPLICE;
+    io_ctx.bytes_desired = splice_size;
+    io_ctx.from_fd = conn1fd;
+    io_ctx.to_fd = pipe1fds[1];
+    io_uring_prep(sqe, io_ctx);
+    sqe->flags |= IOSQE_IO_HARDLINK;
+
+    PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+    io_ctx.op = IOEntryContext::TEE;
+    io_ctx.bytes_desired = splice_size;
+    io_ctx.from_fd = pipe1fds[0];
+    io_ctx.to_fd = pipe2fds[1];
+    io_uring_prep(sqe, io_ctx);
+
+    // std::cerr << "Submitting two chained operations to io_uring.\n";
+    io_uring_submit(&ring);
+
+    int bytes_to_send;
+
+    for (int i = 0; i < 2; i++) {
+      // std::cerr << "Waiting for a completion from io_uring.\n";
+      URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
+      URING_REQUIRE(cqe->res);
+      const int result = cqe->res;
+      io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+      io_uring_cqe_seen(&ring, cqe);
+      /*if (result < io_ctx.bytes_desired) {
+        std::cerr << "Result of the operation i=" << i << ": " << result
+                  << '\n';
+      }*/
+      if (io_ctx.op == IOEntryContext::SPLICE && io_ctx.from_fd == conn1fd &&
+          result == 0) {
+        std::cerr << "Nothing more to read.\n";
+        return 0;
+      }
+      if (i == 0) {
+        bytes_to_send = result;
+      } else {
+        // TODO: Can we tee() less than we splice()? Maybe if conn2 is slow?
+        bytes_to_send = std::min(bytes_to_send, result);
+      }
+    }
+
+    PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+    io_ctx.op = IOEntryContext::SPLICE;
+    io_ctx.bytes_desired = bytes_to_send;
+    io_ctx.from_fd = pipe1fds[0];
+    io_ctx.to_fd = conn1fd;
+    io_uring_prep(sqe, io_ctx);
+
+    PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+    io_ctx.op = IOEntryContext::SPLICE;
+    io_ctx.bytes_desired = bytes_to_send;
+    io_ctx.from_fd = pipe2fds[0];
+    io_ctx.to_fd = conn2fd;
+    io_uring_prep(sqe, io_ctx);
+
+    // std::cerr << "Submitting two unchained operations to io_uring.\n";
+    io_uring_submit(&ring);
+
+    for (int j = 0; j < 2; j++) {
+      // std::cerr << "Waiting for a completion from io_uring.\n";
+      URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
+      // TODO: handle EINTR
+      URING_REQUIRE(cqe->res);
+      const int result = cqe->res;
+      io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+      io_uring_cqe_seen(&ring, cqe);
+      bytes_sent += result;
+      if (result < io_ctx.bytes_desired) {
+        // TODO: This should only happen on account of a signal.
+        // std::cerr << "Result of the operation j=" << j << ": " << result
+        //          << ", so going to submit another splice.\n";
+        io_ctx.bytes_desired -= result;
+        PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+        io_uring_prep(sqe, io_ctx);
+        io_uring_submit(&ring);
+        --j;
+      }
+    }
+  }
+
+  return 0;
+}
+
 int main() {
   int listen1fd = -1, conn1fd = -1;
   int pipe1fds[2] = {-1, -1};
@@ -208,30 +324,30 @@ int main() {
     POSIX_REQUIRE(bind(listen2fd, (sockaddr *)&serv_addr, sizeof(serv_addr)));
     POSIX_REQUIRE(listen(listen2fd, 1));
 
-    // fork() to sink(1338).
+    // fork() to client_sink(1338).
     switch (fork()) {
       case 0:
         // child
         // TODO: Should close all file descriptors except 0 and 1, but meh.
-        std::exit(sink(1338));
+        std::exit(client_sink(1338));
       case -1: {
         const int err = errno;
-        std::cerr << "error forking to sink(1338): " << std::strerror(err)
-                  << '\n';
+        std::cerr << "error forking to client_sink(1338): "
+                  << std::strerror(err) << '\n';
         return err;
       }
     }
 
-    // fork() to source_and_sink(1337).
+    // fork() to client_source_and_sink(1337).
     switch (fork()) {
       case 0:
         // child
         // TODO: Should close all file descriptors except 0 and 1, but meh.
-        std::exit(source_and_sink(1337));
+        std::exit(client_source_and_sink(1337));
       case -1: {
         const int err = errno;
-        std::cerr << "error forking to sink(1338): " << std::strerror(err)
-                  << '\n';
+        std::cerr << "error forking to client_sink(1338): "
+                  << std::strerror(err) << '\n';
         return err;
       }
     }
@@ -248,118 +364,7 @@ int main() {
     POSIX_REQUIRE(conn1fd = accept(listen1fd, NULL, NULL));
     std::cerr << "Connection established.\n";
 
-    const auto interval = std::chrono::seconds(5);
-    const auto start = std::chrono::steady_clock::now();
-    auto last_flush = start;
-    std::uint64_t last_snapshot = 0;
-    constexpr int splice_size = 4096 * 16;
-    std::ofstream log("log");
-
-    for (std::uint64_t bytes_sent = 0;;) {
-      const auto now = std::chrono::steady_clock::now();
-      if (now - last_flush >= interval) {
-        std::ostringstream sstream;
-        sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
-                       .count()
-                << " s\t"
-                << ((bytes_sent - last_snapshot) * (now - last_flush) /
-                    std::chrono::seconds(1) / 1'000'000.0)
-                << " MB/s\n";
-        const auto message = sstream.str();
-        std::cerr << message << std::flush;
-        log << message << std::flush;
-        last_flush = now;
-        last_snapshot = bytes_sent;
-      }
-
-      io_uring_sqe *sqe;
-      io_uring_cqe *cqe;
-      IOEntryContext io_ctx;
-
-      PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
-      io_ctx.op = IOEntryContext::SPLICE;
-      io_ctx.bytes_desired = splice_size;
-      io_ctx.from_fd = conn1fd;
-      io_ctx.to_fd = pipe1fds[1];
-      io_uring_prep(sqe, io_ctx);
-      sqe->flags |= IOSQE_IO_HARDLINK;
-
-      PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
-      io_ctx.op = IOEntryContext::TEE;
-      io_ctx.bytes_desired = splice_size;
-      io_ctx.from_fd = pipe1fds[0];
-      io_ctx.to_fd = pipe2fds[1];
-      io_uring_prep(sqe, io_ctx);
-
-      // std::cerr << "Submitting two chained operations to io_uring.\n";
-      io_uring_submit(&ring);
-
-      int bytes_to_send;
-
-      for (int i = 0; i < 2; i++) {
-        // std::cerr << "Waiting for a completion from io_uring.\n";
-        URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
-        URING_REQUIRE(cqe->res);
-        const int result = cqe->res;
-        io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
-        io_uring_cqe_seen(&ring, cqe);
-        /*if (result < io_ctx.bytes_desired) {
-          std::cerr << "Result of the operation i=" << i << ": " << result
-                    << '\n';
-        }*/
-        if (io_ctx.op == IOEntryContext::SPLICE && io_ctx.from_fd == conn1fd &&
-            result == 0) {
-          std::cerr << "Nothing more to read.\n";
-          return 0;
-        }
-        if (i == 0) {
-          bytes_to_send = result;
-        } else {
-          // TODO: Can we tee() less than we splice()? Maybe if conn2 is slow?
-          bytes_to_send = std::min(bytes_to_send, result);
-        }
-      }
-
-      PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
-      io_ctx.op = IOEntryContext::SPLICE;
-      io_ctx.bytes_desired = bytes_to_send;
-      io_ctx.from_fd = pipe1fds[0];
-      io_ctx.to_fd = conn1fd;
-      io_uring_prep(sqe, io_ctx);
-
-      PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
-      io_ctx.op = IOEntryContext::SPLICE;
-      io_ctx.bytes_desired = bytes_to_send;
-      io_ctx.from_fd = pipe2fds[0];
-      io_ctx.to_fd = conn2fd;
-      io_uring_prep(sqe, io_ctx);
-
-      // std::cerr << "Submitting two unchained operations to io_uring.\n";
-      io_uring_submit(&ring);
-
-      for (int j = 0; j < 2; j++) {
-        // std::cerr << "Waiting for a completion from io_uring.\n";
-        URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
-        // TODO: handle EINTR
-        URING_REQUIRE(cqe->res);
-        const int result = cqe->res;
-        io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
-        io_uring_cqe_seen(&ring, cqe);
-        bytes_sent += result;
-        if (result < io_ctx.bytes_desired) {
-          // TODO: This should only happen on account of a signal.
-          // std::cerr << "Result of the operation j=" << j << ": " << result
-          //          << ", so going to submit another splice.\n";
-          io_ctx.bytes_desired -= result;
-          PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
-          io_uring_prep(sqe, io_ctx);
-          io_uring_submit(&ring);
-          --j;
-        }
-      }
-    }
-
-    return 0;
+    return server_splicetee(ring, conn1fd, conn2fd, pipe1fds, pipe2fds);
   }();
 
   io_uring_queue_exit(&ring);

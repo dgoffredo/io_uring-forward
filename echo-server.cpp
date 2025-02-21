@@ -595,7 +595,7 @@ int main(int argc, char *argv[]) {
     URING_REQUIRE(listen1fd = net->server_socket(1));
     URING_REQUIRE(listen2fd = net->server_socket(1));
 
-    // fork() to client_sink(1338).
+    // fork() to client_sink(...).
     switch (fork()) {
       case 0:
         // child
@@ -603,13 +603,13 @@ int main(int argc, char *argv[]) {
         std::exit(client_sink(bufsize, *net, listen2fd));
       case -1: {
         const int err = errno;
-        std::cerr << "error forking to client_sink(1338): "
-                  << std::strerror(err) << '\n';
+        std::cerr << "error forking to client_sink(): " << std::strerror(err)
+                  << '\n';
         return err;
       }
     }
 
-    // fork() to client_source_and_sink(1337).
+    // fork() to client_source_and_sink(...).
     switch (fork()) {
       case 0:
         // child
@@ -617,7 +617,7 @@ int main(int argc, char *argv[]) {
         std::exit(client_source_and_sink(bufsize, *net, listen1fd));
       case -1: {
         const int err = errno;
-        std::cerr << "error forking to client_sink(1338): "
+        std::cerr << "error forking to client_source_and_sink(): "
                   << std::strerror(err) << '\n';
         return err;
       }

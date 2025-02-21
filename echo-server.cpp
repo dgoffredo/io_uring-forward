@@ -26,7 +26,7 @@ extern "C" {
     const int err = errno;                                       \
     std::cerr << __LINE__ << ": " << #EXPR                       \
               << " failed with: " << std::strerror(err) << '\n'; \
-    return err;                                                  \
+    return -err;                                                 \
   }
 
 #define URING_REQUIRE(EXPR)                                       \
@@ -41,6 +41,54 @@ extern "C" {
     std::cerr << __LINE__ << ": " << #EXPR << " failed\n"; \
     return -1;                                             \
   }
+
+class Net {
+ public:
+  // Return a listening socket bound to a local address, or return `-errno` if
+  // an error occurs.
+  virtual int server_socket(int backlog) = 0;
+
+  // Return a socket connected to the local address to which `server_fd` is
+  // bound, or return `-errno` if an error occurs.
+  virtual int client_socket(int server_fd) = 0;
+};
+
+class TCP : public Net {
+ public:
+  int server_socket(int backlog) override {
+    int sock;
+    sockaddr_in serv_addr = {};
+
+    POSIX_REQUIRE(sock = socket(AF_INET, SOCK_STREAM, 0));
+
+    const int enable = 1;
+    POSIX_REQUIRE(
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof enable));
+
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    serv_addr.sin_port = htons(0);
+
+    POSIX_REQUIRE(bind(sock, (sockaddr *)&serv_addr, sizeof(serv_addr)));
+    POSIX_REQUIRE(listen(sock, backlog));
+
+    return sock;
+  }
+
+  int client_socket(int server_fd) override {
+    sockaddr_in addr = {};
+    socklen_t len = sizeof addr;
+    POSIX_REQUIRE(getsockname(server_fd, (sockaddr *)&addr, &len));
+
+    int sock;
+    POSIX_REQUIRE(sock = socket(AF_INET, SOCK_STREAM, 0));
+    POSIX_REQUIRE(connect(sock, (sockaddr *)&addr, sizeof(addr)));
+
+    return sock;
+  }
+};
+
+// TODO class Unix : public Net {};
 
 struct alignas(8) IOEntryContext {
   enum Operation { TEE, SPLICE, SEND, RECV };
@@ -77,16 +125,10 @@ void io_uring_prep(io_uring_sqe *sqe, IOEntryContext io_ctx, int flags = 0,
   io_uring_sqe_set_data64(sqe, std::bit_cast<std::uint64_t>(io_ctx));
 }
 
-// Connect to 127.0.0.1:<port> and `recv()` continuously, discarding all data.
-int client_sink(int port) {
+// Connect and `recv()` continuously, discarding all data.
+int client_sink(Net &net, int server_sock) {
   int sock;
-  POSIX_REQUIRE(sock = socket(AF_INET, SOCK_STREAM, 0));
-
-  sockaddr_in serv_addr = {};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-  serv_addr.sin_port = htons(port);
-  POSIX_REQUIRE(connect(sock, (sockaddr *)&serv_addr, sizeof(serv_addr)));
+  URING_REQUIRE(sock = net.client_socket(server_sock));
 
   std::vector<char> buffer(4096 * 16);
   for (;;) {
@@ -98,20 +140,14 @@ int client_sink(int port) {
   }
 }
 
-// Connect to 127.0.0.1:<port> and concurrently `send()` zeros and `recv()`,
-// discarding all received data.
-int client_source_and_sink(int port) {
+// Connect and concurrently `send()` zeros and `recv()`, discarding all
+// received data.
+int client_source_and_sink(Net &net, int server_sock) {
   io_uring ring;
   URING_REQUIRE(io_uring_queue_init(8, &ring, 0));
 
   int sock;
-  POSIX_REQUIRE(sock = socket(AF_INET, SOCK_STREAM, 0));
-
-  sockaddr_in serv_addr = {};
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-  serv_addr.sin_port = htons(port);
-  POSIX_REQUIRE(connect(sock, (sockaddr *)&serv_addr, sizeof(serv_addr)));
+  URING_REQUIRE(sock = net.client_socket(server_sock));
 
   io_uring_sqe *sqe;
   io_uring_cqe *cqe;
@@ -398,44 +434,22 @@ int main(int argc, char *argv[]) {
   int pipe1fds[2] = {-1, -1};
   int listen2fd = -1, conn2fd = -1;
   int pipe2fds[2] = {-1, -1};
-  sockaddr_in serv_addr = {};
-  const std::uint16_t echo_port = 1337;
-  const std::uint16_t observer_port = 1338;
+  TCP net;
 
   io_uring ring;
 
   const int rc = [&]() {
     POSIX_REQUIRE(pipe(pipe1fds));
     POSIX_REQUIRE(pipe(pipe2fds));
-    POSIX_REQUIRE(listen1fd = socket(AF_INET, SOCK_STREAM, 0));
-    POSIX_REQUIRE(listen2fd = socket(AF_INET, SOCK_STREAM, 0));
-
-    const int enable = 1;
-    POSIX_REQUIRE(setsockopt(listen1fd, SOL_SOCKET, SO_REUSEADDR, &enable,
-                             sizeof enable));
-    POSIX_REQUIRE(setsockopt(listen2fd, SOL_SOCKET, SO_REUSEADDR, &enable,
-                             sizeof enable));
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    serv_addr.sin_port = htons(echo_port);
-
-    POSIX_REQUIRE(bind(listen1fd, (sockaddr *)&serv_addr, sizeof(serv_addr)));
-    POSIX_REQUIRE(listen(listen1fd, 1));
-
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    serv_addr.sin_port = htons(observer_port);
-
-    POSIX_REQUIRE(bind(listen2fd, (sockaddr *)&serv_addr, sizeof(serv_addr)));
-    POSIX_REQUIRE(listen(listen2fd, 1));
+    URING_REQUIRE(listen1fd = net.server_socket(1));
+    URING_REQUIRE(listen2fd = net.server_socket(1));
 
     // fork() to client_sink(1338).
     switch (fork()) {
       case 0:
         // child
         // TODO: Should close all file descriptors except 0 and 1, but meh.
-        std::exit(client_sink(1338));
+        std::exit(client_sink(net, listen2fd));
       case -1: {
         const int err = errno;
         std::cerr << "error forking to client_sink(1338): "
@@ -449,7 +463,7 @@ int main(int argc, char *argv[]) {
       case 0:
         // child
         // TODO: Should close all file descriptors except 0 and 1, but meh.
-        std::exit(client_source_and_sink(1337));
+        std::exit(client_source_and_sink(net, listen1fd));
       case -1: {
         const int err = errno;
         std::cerr << "error forking to client_sink(1338): "
@@ -460,15 +474,13 @@ int main(int argc, char *argv[]) {
 
     URING_REQUIRE(io_uring_queue_init(8, &ring, 0));
 
-    std::cerr << "Waiting for observer client to connect on port "
-              << observer_port << ".\n";
+    std::cerr << "Waiting for observer client to connect on observer socket.\n";
     POSIX_REQUIRE(conn2fd = accept(listen2fd, NULL, NULL));
-    std::cerr << "Connection established.\n";
+    std::cerr << "Observer connection established.\n";
 
-    std::cerr << "Waiting for echo client to connect on port " << echo_port
-              << ".\n";
+    std::cerr << "Waiting for echo client to connect on echo socket.\n";
     POSIX_REQUIRE(conn1fd = accept(listen1fd, NULL, NULL));
-    std::cerr << "Connection established.\n";
+    std::cerr << "Echo connection established.\n";
 
     switch (server_mode) {
       case RECVSEND:

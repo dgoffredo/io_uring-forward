@@ -17,7 +17,9 @@ extern "C" {
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <ostream>
 #include <sstream>
+#include <utility>
 
 #define POSIX_REQUIRE(EXPR)                                      \
   if (-1 == (EXPR)) {                                            \
@@ -70,8 +72,7 @@ void io_uring_prep(io_uring_sqe *sqe, IOEntryContext io_ctx, int flags = 0,
                          flags);
       break;
     default:
-      // TODO
-      std::abort();
+      std::unreachable();
   }
   io_uring_sqe_set_data64(sqe, std::bit_cast<std::uint64_t>(io_ctx));
 }
@@ -171,6 +172,9 @@ int client_source_and_sink(int port) {
   }
 }
 
+// Consume from `conn1fd` and duplicate all data onto `connfd1` and `connfd2`.
+// Use `splice()` and `tee()`, involving the pipes `pipe1fds` and `pipe2fds`,
+// to prevent any copies of data into user space.
 int server_splicetee(io_uring &ring, int conn1fd, int conn2fd,
                      int (&pipe1fds)[2], int (&pipe2fds)[2]) {
   const auto interval = std::chrono::seconds(5);
@@ -287,7 +291,109 @@ int server_splicetee(io_uring &ring, int conn1fd, int conn2fd,
   return 0;
 }
 
-int main() {
+// Consume from `conn1fd` and duplicate all data onto `connfd1` and `connfd2`.
+// Use `recv()` and `send()` with a buffer in user space.
+int server_recvsend(io_uring &ring, int conn1fd, int conn2fd) {
+  const auto interval = std::chrono::seconds(5);
+  const auto start = std::chrono::steady_clock::now();
+  auto last_flush = start;
+  std::uint64_t last_snapshot = 0;
+  std::ofstream log("log");
+
+  std::vector<char> buffer(4096 * 16);
+
+  for (std::uint64_t bytes_sent = 0;;) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_flush >= interval) {
+      std::ostringstream sstream;
+      sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
+                     .count()
+              << " s\t"
+              << ((bytes_sent - last_snapshot) * (now - last_flush) /
+                  std::chrono::seconds(1) / 1'000'000.0)
+              << " MB/s\n";
+      const auto message = sstream.str();
+      std::cout << message << std::flush;
+      log << message << std::flush;
+      last_flush = now;
+      last_snapshot = bytes_sent;
+    }
+
+    int bytes_to_send = recv(conn1fd, buffer.data(), buffer.size(), 0);
+    POSIX_REQUIRE(bytes_to_send);
+    if (bytes_to_send == 0) {
+      std::cerr << "Nothing more to read.\n";
+      return 0;
+    }
+
+    io_uring_sqe *sqe;
+    io_uring_cqe *cqe;
+    IOEntryContext io_ctx;
+
+    PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+    io_ctx.op = IOEntryContext::SEND;
+    io_ctx.bytes_desired = bytes_to_send;
+    io_ctx.to_fd = conn1fd;
+    io_uring_prep(sqe, io_ctx, 0, buffer.data());
+
+    PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+    io_ctx.op = IOEntryContext::SEND;
+    io_ctx.bytes_desired = bytes_to_send;
+    io_ctx.to_fd = conn2fd;
+    io_uring_prep(sqe, io_ctx, 0, buffer.data());
+
+    // std::cerr << "Submitting two unchained send() operations to io_uring.\n";
+    io_uring_submit(&ring);
+
+    for (int j = 0; j < 2; j++) {
+      // std::cerr << "Waiting for a completion from io_uring. j=" << j << '\n';
+      URING_REQUIRE(io_uring_wait_cqe(&ring, &cqe));
+      // TODO: handle EINTR
+      URING_REQUIRE(cqe->res);
+      const int result = cqe->res;
+      io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
+      io_uring_cqe_seen(&ring, cqe);
+      bytes_sent += result;
+      if (result < io_ctx.bytes_desired) {
+        // TODO: This should only happen on account of a signal.
+        // std::cerr << "Result of the operation j=" << j << ": " << result
+        //           << ", so going to submit another send().\n";
+        io_ctx.bytes_desired -= result;
+        PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
+        io_uring_prep(sqe, io_ctx, 0, buffer.data() + result);
+        io_uring_submit(&ring);
+        --j;
+      }
+    }
+  }
+
+  return 0;
+}
+
+void usage(std::ostream &out, const char *argv0) {
+  out << "usage: " << argv0 << " <recvsend | splicetee>\n";
+}
+
+int main(int argc, char *argv[]) {
+  enum { RECVSEND, SPLICETEE } server_mode;
+  if (argc != 2) {
+    usage(std::cerr, argv[0]);
+    return 1;
+  }
+  const std::string_view arg{argv[1]};
+  if (arg == "-h" || arg == "--help") {
+    usage(std::cout, argv[0]);
+    return 0;
+  }
+  if (arg == "recvsend") {
+    server_mode = RECVSEND;
+  } else if (arg == "splicetee") {
+    server_mode = SPLICETEE;
+  } else {
+    usage(std::cerr, argv[0]);
+    return 2;
+  }
+
   int listen1fd = -1, conn1fd = -1;
   int pipe1fds[2] = {-1, -1};
   int listen2fd = -1, conn2fd = -1;
@@ -364,7 +470,14 @@ int main() {
     POSIX_REQUIRE(conn1fd = accept(listen1fd, NULL, NULL));
     std::cerr << "Connection established.\n";
 
-    return server_splicetee(ring, conn1fd, conn2fd, pipe1fds, pipe2fds);
+    switch (server_mode) {
+      case RECVSEND:
+        return server_recvsend(ring, conn1fd, conn2fd);
+      case SPLICETEE:
+        return server_splicetee(ring, conn1fd, conn2fd, pipe1fds, pipe2fds);
+      default:
+        std::unreachable();
+    }
   }();
 
   io_uring_queue_exit(&ring);

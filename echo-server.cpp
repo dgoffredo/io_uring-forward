@@ -39,7 +39,7 @@ extern "C" {
   if (const int err = (EXPR); err < 0) {                          \
     std::cerr << __LINE__ << ": " << #EXPR                        \
               << " failed with: " << std::strerror(-err) << '\n'; \
-    return -err;                                                  \
+    return err;                                                   \
   }
 
 #define PTR_REQUIRE(EXPR)                                  \

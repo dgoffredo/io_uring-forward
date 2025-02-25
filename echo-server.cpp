@@ -351,7 +351,7 @@ std::string log_snapshot_diff(std::chrono::steady_clock::time_point start,
   };
 
   std::ostringstream sstream;
-  sstream << (now - start) / seconds(1) << " s\t"
+  sstream << (now - start) / milliseconds(1) << " milliseconds\t"
           << scaled_diff(&RawMetrics::bytes_sent) / 1'000'000 << " MB/s\t"
           << scaled_diff(&RawMetrics::short_reads) << " short_reads/s\t"
           << scaled_diff(&RawMetrics::short_writes_echo)
@@ -360,8 +360,10 @@ std::string log_snapshot_diff(std::chrono::steady_clock::time_point start,
           << " short_writes_observer/s\t"
           << scaled_diff(&RawMetrics::short_writes_pipe)
           << " short_writes_pipe/s\t"
+          // Note: NOT per second (at least not necessarily)
           << diff(&RawMetrics::cpu_user) / milliseconds(1)
           << " cpu_user_milliseconds\t"
+          // Note: NOT per second (at least not necessarily)
           << diff(&RawMetrics::cpu_system) / milliseconds(1)
           << " cpu_system_milliseconds\t"
           << scaled_diff(&RawMetrics::page_faults_minor)
@@ -378,7 +380,7 @@ std::string log_snapshot_diff(std::chrono::steady_clock::time_point start,
 // to prevent any copies of data into user space.
 int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
                      int (&pipe1fds)[2], int (&pipe2fds)[2]) {
-  const auto interval = std::chrono::seconds(5);
+  const auto interval = std::chrono::seconds(1);
   const auto start = std::chrono::steady_clock::now();
   Metrics metrics;
   metrics.snapshot.when = start;
@@ -501,7 +503,7 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
 // Consume from `conn1fd` and duplicate all data onto `connfd1` and `connfd2`.
 // Use `recv()` and `send()` with a buffer in user space.
 int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
-  const auto interval = std::chrono::seconds(5);
+  const auto interval = std::chrono::seconds(1);
   const auto start = std::chrono::steady_clock::now();
 
   Metrics metrics;

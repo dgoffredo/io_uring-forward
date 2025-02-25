@@ -1,0 +1,19 @@
+#!/bin/sh
+
+cat <<'END_GNUPLOT'
+set style data histograms
+set boxwidth 0.9 relative
+set style fill solid 1.0 border -1
+
+set title 'Histogram of Output Throughput'
+set ylabel 'count'
+set xlabel 'send/splice throughput (MB/s)'
+
+END_GNUPLOT
+
+printf 'plot'
+for hist in "$@"; do
+  printf " '%s' u 2:%s title '%s'," "$hist" 'xticlabels(sprintf("%.0f", $1))' "${hist%%.log.hist}"
+done
+printf '\n'
+

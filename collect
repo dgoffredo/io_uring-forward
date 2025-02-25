@@ -2,10 +2,10 @@
 
 set -x
 
-seconds=1200
+seconds=2400
 sed_script="/^$seconds s/q"
 
-for pages in $(seq 16 -1 1); do
+for pages in $(seq 32 -1 1); do
   for family in tcp unix; do
     for io in splicetee recvsend; do
       ./echo-server "$io" "$family" "$pages" | sed "$sed_script"

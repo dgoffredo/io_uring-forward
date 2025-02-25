@@ -1,6 +1,7 @@
 extern "C" {
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -263,6 +264,115 @@ int client_source_and_sink(int bufsize, Net &net, int server_sock) {
   }
 }
 
+struct RawMetrics {
+  std::uint64_t bytes_sent = 0;
+  std::uint64_t short_reads = 0;
+  std::uint64_t short_writes_echo = 0;
+  std::uint64_t short_writes_observer = 0;
+  std::uint64_t short_writes_pipe = 0;
+  std::chrono::steady_clock::duration cpu_user =
+      std::chrono::steady_clock::duration();
+  std::chrono::steady_clock::duration cpu_system =
+      std::chrono::steady_clock::duration();
+  std::uint64_t page_faults_minor = 0;
+  std::uint64_t page_faults_major = 0;
+  std::uint64_t yields = 0;
+  std::uint64_t preempts = 0;
+};
+
+struct Snapshot : public RawMetrics {
+  std::chrono::steady_clock::time_point when;
+};
+
+struct Metrics : public RawMetrics {
+  Snapshot snapshot;
+};
+
+int get_resource_usage(RawMetrics &raw) {
+  rusage usage = {};
+  POSIX_REQUIRE(getrusage(RUSAGE_SELF, &usage));
+
+  using namespace std::chrono;
+  raw.cpu_user =
+      seconds(usage.ru_utime.tv_sec) + microseconds(usage.ru_utime.tv_usec);
+  raw.cpu_system =
+      seconds(usage.ru_stime.tv_sec) + microseconds(usage.ru_stime.tv_usec);
+  raw.page_faults_minor = usage.ru_minflt;
+  raw.page_faults_major = usage.ru_majflt;
+  raw.yields = usage.ru_nvcsw;
+  raw.preempts = usage.ru_nivcsw;
+
+  return 0;
+}
+
+/* man(7) documentation relevant to the above:
+
+       ru_utime
+              This is the total amount of time spent executing in user
+              mode, expressed in a timeval structure (seconds plus
+              microseconds).
+
+       ru_stime
+              This is the total amount of time spent executing in kernel
+              mode, expressed in a timeval structure (seconds plus
+              microseconds).
+
+       ru_minflt
+              The number of page faults serviced without any I/O
+              activity; here I/O activity is avoided by “reclaiming” a
+              page frame from the list of pages awaiting reallocation.
+
+       ru_majflt
+              The number of page faults serviced that required I/O
+              activity.
+
+       ru_nvcsw (since Linux 2.6)
+              The number of times a context switch resulted due to a
+              process voluntarily giving up the processor before its time
+              slice was completed (usually to await availability of a
+              resource).
+
+       ru_nivcsw (since Linux 2.6)
+              The number of times a context switch resulted due to a
+              higher priority process becoming runnable or because the
+              current process exceeded its time slice.
+*/
+
+std::string log_snapshot_diff(std::chrono::steady_clock::time_point start,
+                              std::chrono::steady_clock::time_point now,
+                              const Metrics &metrics) {
+  using namespace std::chrono;
+
+  const auto diff = [&](const auto &mem_ptr) {
+    return (metrics.*mem_ptr - metrics.snapshot.*mem_ptr);
+  };
+  const auto scaled_diff = [&](const auto &mem_ptr) {
+    return diff(mem_ptr) * seconds(1) / (now - metrics.snapshot.when);
+  };
+
+  std::ostringstream sstream;
+  sstream << (now - start) / seconds(1) << " s\t"
+          << scaled_diff(&RawMetrics::bytes_sent) / 1'000'000 << " MB/s\t"
+          << scaled_diff(&RawMetrics::short_reads) << " short_reads/s\t"
+          << scaled_diff(&RawMetrics::short_writes_echo)
+          << " short_writes_echo/s\t"
+          << scaled_diff(&RawMetrics::short_writes_observer)
+          << " short_writes_observer/s\t"
+          << scaled_diff(&RawMetrics::short_writes_pipe)
+          << " short_writes_pipe/s\t"
+          << diff(&RawMetrics::cpu_user) / milliseconds(1)
+          << " cpu_user_milliseconds\t"
+          << diff(&RawMetrics::cpu_system) / milliseconds(1)
+          << " cpu_system_milliseconds\t"
+          << scaled_diff(&RawMetrics::page_faults_minor)
+          << " minor_page_faults/s\t"
+          << scaled_diff(&RawMetrics::page_faults_major)
+          << " major_page_faults/s\t" << scaled_diff(&RawMetrics::yields)
+          << " yields/s\t" << scaled_diff(&RawMetrics::preempts)
+          << " preempts/s\n";
+  return sstream.str();
+}
+
 // Consume from `conn1fd` and duplicate all data onto `connfd1` and `connfd2`.
 // Use `splice()` and `tee()`, involving the pipes `pipe1fds` and `pipe2fds`,
 // to prevent any copies of data into user space.
@@ -270,55 +380,21 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
                      int (&pipe1fds)[2], int (&pipe2fds)[2]) {
   const auto interval = std::chrono::seconds(5);
   const auto start = std::chrono::steady_clock::now();
-  struct {
-    std::chrono::steady_clock::time_point when;
-    std::uint64_t bytes_sent = 0;
-    std::uint64_t short_reads = 0;
-    std::uint64_t short_writes_echo = 0;
-    std::uint64_t short_writes_observer = 0;
-    std::uint64_t short_writes_pipe = 0;
-  } snapshot;
-  snapshot.when = start;
+  Metrics metrics;
+  metrics.snapshot.when = start;
 
   const int splice_size = bufsize;
   std::ofstream log("log");
 
-  std::uint64_t bytes_sent = 0;
-  std::uint64_t short_reads = 0;
-  std::uint64_t short_writes_echo = 0;
-  std::uint64_t short_writes_observer = 0;
-  std::uint64_t short_writes_pipe = 0;
-
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - snapshot.when >= interval) {
-      std::ostringstream sstream;
-      sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
-                     .count()
-              << " s\t"
-              << ((bytes_sent - snapshot.bytes_sent) * std::chrono::seconds(1) /
-                  (now - snapshot.when) / 1'000'000)
-              << " MB/s\t"
-              << ((short_reads - snapshot.short_reads) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_reads/s\t"
-              << ((short_writes_echo - snapshot.short_writes_echo) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_writes_echo/s\t"
-              << ((short_writes_observer - snapshot.short_writes_observer) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_writes_observer/s\t"
-              << ((short_writes_pipe - snapshot.short_writes_pipe) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_writes_pipe/s\n";
-      const auto message = sstream.str();
+    if (now - metrics.snapshot.when >= interval) {
+      URING_REQUIRE(get_resource_usage(metrics));
+      const std::string message = log_snapshot_diff(start, now, metrics);
       std::cout << message << std::flush;
       log << message << std::flush;
-      snapshot.when = now;
-      snapshot.bytes_sent = bytes_sent;
-      snapshot.short_reads = short_reads;
-      snapshot.short_writes_echo = short_writes_echo;
-      snapshot.short_writes_observer = short_writes_observer;
+      metrics.snapshot.when = now;
+      static_cast<RawMetrics &>(metrics.snapshot) = metrics;
     }
 
     io_uring_sqe *sqe;
@@ -355,10 +431,10 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
       if (result < io_ctx.bytes_desired) {
         switch (io_ctx.op) {
           case IOEntryContext::SPLICE:
-            ++short_reads;
+            ++metrics.short_reads;
             break;
           case IOEntryContext::TEE:
-            ++short_writes_pipe;
+            ++metrics.short_writes_pipe;
             break;
           default:
             break;
@@ -402,13 +478,13 @@ int server_splicetee(int bufsize, io_uring &ring, int conn1fd, int conn2fd,
       const int result = cqe->res;
       io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
       io_uring_cqe_seen(&ring, cqe);
-      bytes_sent += result;
+      metrics.bytes_sent += result;
       if (result < io_ctx.bytes_desired) {
         // TODO: This should only happen on account of a signal.
         if (io_ctx.to_fd == conn1fd) {
-          ++short_writes_echo;
+          ++metrics.short_writes_echo;
         } else if (io_ctx.to_fd == conn2fd) {
-          ++short_writes_observer;
+          ++metrics.short_writes_observer;
         }
         io_ctx.bytes_desired -= result;
         PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));
@@ -428,56 +504,21 @@ int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
   const auto interval = std::chrono::seconds(5);
   const auto start = std::chrono::steady_clock::now();
 
-  struct {
-    std::chrono::steady_clock::time_point when;
-    std::uint64_t bytes_sent = 0;
-    std::uint64_t short_reads = 0;
-    std::uint64_t short_writes_echo = 0;
-    std::uint64_t short_writes_observer = 0;
-    std::uint64_t short_writes_pipe = 0;
-  } snapshot;
-  snapshot.when = start;
+  Metrics metrics;
+  metrics.snapshot.when = start;
 
   std::ofstream log("log");
-
-  std::uint64_t bytes_sent = 0;
-  std::uint64_t short_reads = 0;
-  std::uint64_t short_writes_echo = 0;
-  std::uint64_t short_writes_observer = 0;
-  std::uint64_t short_writes_pipe = 0;
-
   std::vector<char> buffer(bufsize);
 
   for (;;) {
     const auto now = std::chrono::steady_clock::now();
-    if (now - snapshot.when >= interval) {
-      std::ostringstream sstream;
-      sstream << std::chrono::duration_cast<std::chrono::seconds>(now - start)
-                     .count()
-              << " s\t"
-              << ((bytes_sent - snapshot.bytes_sent) * std::chrono::seconds(1) /
-                  (now - snapshot.when) / 1'000'000)
-              << " MB/s\t"
-              << ((short_reads - snapshot.short_reads) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_reads/s\t"
-              << ((short_writes_echo - snapshot.short_writes_echo) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_writes_echo/s\t"
-              << ((short_writes_observer - snapshot.short_writes_observer) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_writes_observer/s\t"
-              << ((short_writes_pipe - snapshot.short_writes_pipe) *
-                  std::chrono::seconds(1) / (now - snapshot.when))
-              << " short_writes_pipe/s\n";
-      const auto message = sstream.str();
+    if (now - metrics.snapshot.when >= interval) {
+      URING_REQUIRE(get_resource_usage(metrics));
+      const std::string message = log_snapshot_diff(start, now, metrics);
       std::cout << message << std::flush;
       log << message << std::flush;
-      snapshot.when = now;
-      snapshot.bytes_sent = bytes_sent;
-      snapshot.short_reads = short_reads;
-      snapshot.short_writes_echo = short_writes_echo;
-      snapshot.short_writes_observer = short_writes_observer;
+      metrics.snapshot.when = now;
+      static_cast<RawMetrics &>(metrics.snapshot) = metrics;
     }
 
     int bytes_to_send = recv(conn1fd, buffer.data(), buffer.size(), 0);
@@ -487,7 +528,7 @@ int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
       return 0;
     }
     if (std::size_t(bytes_to_send) < buffer.size()) {
-      ++short_reads;
+      ++metrics.short_reads;
     }
 
     io_uring_sqe *sqe;
@@ -517,13 +558,13 @@ int server_recvsend(int bufsize, io_uring &ring, int conn1fd, int conn2fd) {
       const int result = cqe->res;
       io_ctx = std::bit_cast<IOEntryContext>(io_uring_cqe_get_data64(cqe));
       io_uring_cqe_seen(&ring, cqe);
-      bytes_sent += result;
+      metrics.bytes_sent += result;
       if (result < io_ctx.bytes_desired) {
         // TODO: This should only happen on account of a signal.
         if (io_ctx.to_fd == conn1fd) {
-          ++short_writes_echo;
+          ++metrics.short_writes_echo;
         } else if (io_ctx.to_fd == conn2fd) {
-          ++short_writes_observer;
+          ++metrics.short_writes_observer;
         }
         io_ctx.bytes_desired -= result;
         PTR_REQUIRE(sqe = io_uring_get_sqe(&ring));

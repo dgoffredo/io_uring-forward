@@ -1,4 +1,8 @@
 # build
 /echo-server
+/echo-server-simple
 /forky
 .last-format
+
+# output
+/log

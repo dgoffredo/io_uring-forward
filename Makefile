@@ -1,10 +1,13 @@
 .PHONY: all
-all: echo-server echo-server-simple forky
+all: echo-server echo-server-simple echo-server-simpler forky
 
 echo-server: echo-server.cpp echo-server.cflags echo-server.lflags
 	$(CXX) $(file < echo-server.cflags) -o $@ $< $(file < echo-server.lflags)
 
 echo-server-simple: echo-server-simple.cpp echo-server.cflags echo-server.lflags
+	$(CXX) $(file < echo-server.cflags) -o $@ $< $(file < echo-server.lflags)
+
+echo-server-simpler: echo-server-simpler.cpp echo-server.cflags echo-server.lflags
 	$(CXX) $(file < echo-server.cflags) -o $@ $< $(file < echo-server.lflags)
 
 forky: forky.cpp echo-server.cflags echo-server.lflags

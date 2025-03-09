@@ -1,6 +1,7 @@
 # build
 /echo-server
 /echo-server-simple
+/echo-server-simpler
 /forky
 .last-format
 

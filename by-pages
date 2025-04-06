@@ -1,0 +1,31 @@
+#!/bin/sh
+
+append_stats() {
+  size=$1
+  input=$2
+  output=$3
+
+  echo $size $(awk '{print $3}' $input | st --mean --sd --no-header) >>$output
+}
+
+for method in recvsend splice; do
+  for io in tcp unix; do
+    output=$method-$io.by-pages
+    rm -f $output 2>/dev/null
+
+    for f in $method-$io-*.log; do
+      size=${f#$method-$io-}
+      size=${size%.log}
+      
+      append_stats $size $f $output &
+    done
+  done
+done
+
+wait
+
+tmp=$(mktemp)
+for f in *.by-pages; do
+  sort $f >$tmp
+  mv $tmp $f
+done

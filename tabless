@@ -1,0 +1,33 @@
+#!/bin/sh
+
+# usage: ./tabless INPUT_FILE
+#
+# INPUT_FILE is expected to be a text file containing lines like the following:
+#
+#     23 column-1-name -554.23 column-2-name ...
+#
+# The output will be a `less` session of the numbers only, tabulated, but with
+# a header of column names pinned to the top line, e.g.
+#
+#     column-1-name   column-2-name
+#                23         -554.23
+#                  ...
+#     :         
+#
+# Note that this requires a version of `less` that supports the `--header`
+# option, i.e. version 600 or later.
+
+input=$1
+
+print_header() {
+  # Skip the odd-numbered columns (one-based), and stop after the first line.
+  awk '{ for (i=1;i<=NF;i+=2) $i=""; print $0 } (NR == 1) { exit }' "$input"
+}
+
+print_data() {
+  # Skip the even-numbered columns (one-based).
+  awk '{ for (i=2;i<=NF;i+=2) $i=""; print $0 }' "$input"
+}
+
+{ print_header; print_data; } | column -t -R 0 | less --header 1
+

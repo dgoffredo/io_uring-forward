@@ -27,6 +27,7 @@ extern "C" {
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #define POSIX_REQUIRE(EXPR)                                      \
   if (-1 == (EXPR)) {                                            \

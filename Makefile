@@ -7,3 +7,4 @@ echo-server: echo-server.cpp echo-server.cflags echo-server.lflags
 .PHONY: format
 format:
 	find . -type f \( -name '*.h' -o -name '*.cpp' \) -print0 | xargs -0 clang-format -i --style='{BasedOnStyle: Google, Language: Cpp, ColumnLimit: 80}'
+

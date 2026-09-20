@@ -1,0 +1,49 @@
+#!/bin/sh
+
+set -e
+
+db=$(mktemp)
+
+sqlite3 "$db" <<'END_SQL'
+create table server_stats(
+    io_method text not null, -- 'splice' or 'recvsend'
+    address_family text not null, -- 'tcp' or 'unix'
+    io_pages integer not null, -- pages of memory per send/recv/splice
+    offset_milliseconds real not null, -- timestamp of the run; each run starts at zero
+    output_megabytes_per_second real not null, -- "megabyte" = "1,000,000 bytes"
+    short_reads_per_second real not null,
+    short_writes_echo_per_second real not null,
+    cpu_user_milliseconds real not null,
+    cpu_system_milliseconds real not null,
+    minor_page_faults_per_second real not null,
+    major_page_faults_per_second real not null,
+    yields_per_second real not null,
+    preempts_per_second real not null
+);
+END_SQL
+
+for log in *-*-*.log; do
+  # (splice|recvsend) "-" (tcp|unix) "-" [0-9]+ ".log"
+  parts3=${log%.log}
+  io_pages=${parts3##*-}
+  io_method=${parts3%%-*}
+  parts2=${log%-*}
+  address_family=${parts2#*-}
+
+  # echo "io_pages=$io_pages io_method=$io_method address_family=$address_family"
+  awk \
+    -v io_method=$io_method \
+    -v address_family=$address_family \
+    -v io_pages=$io_pages \
+    '{print io_method, address_family, io_pages, $1, $3, $5, $7, $9, $11, $13, $15, $17, $19}' "$log" >"$log.tmp"
+
+  sqlite3 "$db" <<END_SQL
+.separator " "
+.import "$log.tmp" server_stats
+END_SQL
+
+  rm "$log.tmp"
+done
+
+mv "$db" db.sqlite
+
